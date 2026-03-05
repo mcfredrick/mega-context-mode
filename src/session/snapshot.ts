@@ -86,16 +86,52 @@ export function renderActiveFiles(fileEvents: StoredEvent[]): string {
 
 /**
  * Render <task_state> from task events.
- * Shows the most recent task state (last event's data).
+ * Reconstructs the full task list from create/update events,
+ * filters out completed tasks, and renders only pending/in-progress work.
+ *
+ * TaskCreate events have `{ subject }`, TaskUpdate events have `{ taskId, status }`.
+ * Match by chronological order: creates[0] → lowest taskId from updates.
  */
 export function renderTaskState(taskEvents: StoredEvent[]): string {
   if (taskEvents.length === 0) return "";
 
-  // Use the last task event as the most current state
-  const lastTask = taskEvents[taskEvents.length - 1];
-  const data = truncateString(escapeXML(lastTask.data), 200);
+  const creates: string[] = [];
+  const updates: Record<string, string> = {};
 
-  return `  <task_state>\n    ${data}\n  </task_state>`;
+  for (const ev of taskEvents) {
+    try {
+      const parsed = JSON.parse(ev.data) as Record<string, unknown>;
+      if (typeof parsed.subject === "string") {
+        creates.push(parsed.subject);
+      } else if (typeof parsed.taskId === "string" && typeof parsed.status === "string") {
+        updates[parsed.taskId] = parsed.status;
+      }
+    } catch { /* not JSON */ }
+  }
+
+  if (creates.length === 0) return "";
+
+  // Match creates to updates positionally (creates[0] → lowest taskId)
+  const sortedIds = Object.keys(updates).sort((a, b) => Number(a) - Number(b));
+
+  const pending: string[] = [];
+  for (let i = 0; i < creates.length; i++) {
+    const matchedId = sortedIds[i];
+    const status = matchedId ? (updates[matchedId] ?? "pending") : "pending";
+    if (status !== "completed") {
+      pending.push(creates[i]);
+    }
+  }
+
+  // All tasks completed — nothing to render
+  if (pending.length === 0) return "";
+
+  const lines: string[] = ["  <task_state>"];
+  for (const task of pending) {
+    lines.push(`    - ${escapeXML(truncateString(task, 100))}`);
+  }
+  lines.push("  </task_state>");
+  return lines.join("\n");
 }
 
 /**

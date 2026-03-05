@@ -62,10 +62,44 @@ export function writeSessionEventsFile(events, eventsPath) {
   }
 
   if (grouped.task?.length > 0) {
-    lines.push("## Tasks In Progress");
-    lines.push("");
-    for (const ev of grouped.task) lines.push(`- ${ev.data}`);
-    lines.push("");
+    const creates = [];
+    const updates = {};
+    for (const ev of grouped.task) {
+      try {
+        const parsed = JSON.parse(ev.data);
+        if (parsed.subject) {
+          creates.push(parsed.subject);
+        } else if (parsed.taskId && parsed.status) {
+          updates[parsed.taskId] = parsed.status;
+        }
+      } catch { /* not JSON — dump as-is */
+        creates.push(ev.data);
+      }
+    }
+    const sortedIds = Object.keys(updates).sort((a, b) => Number(a) - Number(b));
+    const pending = [];
+    const completed = [];
+    for (let i = 0; i < creates.length; i++) {
+      const matchedId = sortedIds[i];
+      const status = matchedId ? (updates[matchedId] || "pending") : "pending";
+      if (status === "completed") {
+        completed.push(creates[i]);
+      } else {
+        pending.push(creates[i]);
+      }
+    }
+    if (pending.length > 0) {
+      lines.push("## Tasks In Progress");
+      lines.push("");
+      for (const task of pending) lines.push(`- ${task}`);
+      lines.push("");
+    }
+    if (completed.length > 0) {
+      lines.push("## Tasks Completed");
+      lines.push("");
+      for (const task of completed) lines.push(`- ${task}`);
+      lines.push("");
+    }
   }
 
   if (grouped.decision?.length > 0) {
@@ -179,10 +213,11 @@ export function buildSessionDirective(source, eventMeta) {
     block += `\n`;
   }
 
-  // 2. Tasks — parsed into readable format with status
+  // 2. Tasks — parsed into readable format, only pending/in-progress shown
   // TaskCreate events have {subject} but no taskId.
   // TaskUpdate events have {taskId, status} but no subject.
   // Match by chronological order: creates[0] → lowest taskId from updates.
+  // Completed tasks are excluded — the model should not re-work them.
   if (grouped.task?.length > 0) {
     const creates = [];
     const updates = {};
@@ -200,14 +235,21 @@ export function buildSessionDirective(source, eventMeta) {
 
     if (creates.length > 0) {
       const sortedIds = Object.keys(updates).sort((a, b) => Number(a) - Number(b));
-      block += `\n## Tasks`;
+      const pending = [];
       for (let i = 0; i < creates.length; i++) {
         const matchedId = sortedIds[i];
         const status = matchedId ? (updates[matchedId] || "pending") : "pending";
-        const mark = status === "completed" ? "x" : " ";
-        block += `\n- [${mark}] ${creates[i]}`;
+        if (status !== "completed") {
+          pending.push(creates[i]);
+        }
       }
-      block += `\n`;
+      if (pending.length > 0) {
+        block += `\n## Pending Tasks`;
+        for (const task of pending) {
+          block += `\n- ${task}`;
+        }
+        block += `\n`;
+      }
     }
   }
 

@@ -118,9 +118,10 @@ describe("Slice 4: File Limit", () => {
 // ════════════════════════════════════════════
 
 describe("Slice 5: Task State", () => {
-  test("buildResumeSnapshot with task events includes task_state", () => {
+  test("buildResumeSnapshot with pending task events includes task_state", () => {
     const events: StoredEvent[] = [
-      makeEvent({ type: "task", category: "task", data: '[{"id":"1","content":"Write tests","status":"in_progress"}]', priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ subject: "Write tests" }), priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ taskId: "1", status: "in_progress" }), priority: 1 }),
     ];
     const xml = buildResumeSnapshot(events);
     assert.ok(xml.includes("<task_state>"), "should include <task_state>");
@@ -128,13 +129,24 @@ describe("Slice 5: Task State", () => {
     assert.ok(xml.includes("</task_state>"), "should close task_state");
   });
 
-  test("renderTaskState uses the most recent task event", () => {
+  test("renderTaskState filters completed tasks and shows only pending", () => {
     const events: StoredEvent[] = [
-      makeEvent({ type: "task", category: "task", data: "Old task state", priority: 1 }),
-      makeEvent({ type: "task", category: "task", data: "Current task state", priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ subject: "Old task" }), priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ subject: "Current task" }), priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ taskId: "1", status: "completed" }), priority: 1 }),
     ];
     const xml = renderTaskState(events);
-    assert.ok(xml.includes("Current task state"), "should show the last task event");
+    assert.ok(!xml.includes("Old task"), "should NOT show completed task");
+    assert.ok(xml.includes("Current task"), "should show pending task");
+  });
+
+  test("renderTaskState returns empty when all tasks completed", () => {
+    const events: StoredEvent[] = [
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ subject: "Done task" }), priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ taskId: "1", status: "completed" }), priority: 1 }),
+    ];
+    const xml = renderTaskState(events);
+    assert.equal(xml, "", "should return empty when all tasks completed");
   });
 });
 
@@ -500,7 +512,7 @@ describe("Edge Cases", () => {
     const events: StoredEvent[] = [
       makeEvent({ type: "file", category: "file", data: "src/server.ts", priority: 1 }),
       makeEvent({ type: "file_read", category: "file", data: "src/store.ts", priority: 1 }),
-      makeEvent({ type: "task", category: "task", data: "Implement session continuity", priority: 1 }),
+      makeEvent({ type: "task", category: "task", data: JSON.stringify({ subject: "Implement session continuity" }), priority: 1 }),
       makeEvent({ type: "rule", category: "rule", data: "CLAUDE.md: Never set Claude as git author", priority: 1 }),
       makeEvent({ type: "decision", category: "decision", data: "use ctx- prefix, not cm-", priority: 2 }),
       makeEvent({ type: "cwd", category: "cwd", data: "/Users/mksglu/project", priority: 2 }),
