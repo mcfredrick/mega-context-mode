@@ -1,9 +1,15 @@
-# Context Mode
+# mega-context-mode
 
-**The other half of the context problem.**
+**The other half of the context problem — with persistent cross-session knowledge.**
 
-[![users](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.message&label=users&color=brightgreen)](https://www.npmjs.com/package/context-mode) [![npm](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.npm&label=npm&color=blue)](https://www.npmjs.com/package/context-mode) [![marketplace](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fcontext-mode%40main%2Fstats.json&query=%24.marketplace&label=marketplace&color=blue)](https://github.com/mksglu/context-mode) [![GitHub stars](https://img.shields.io/github/stars/mksglu/context-mode?style=flat&color=yellow)](https://github.com/mksglu/context-mode/stargazers) [![GitHub forks](https://img.shields.io/github/forks/mksglu/context-mode?style=flat&color=blue)](https://github.com/mksglu/context-mode/network/members) [![Last commit](https://img.shields.io/github/last-commit/mksglu/context-mode?color=green)](https://github.com/mksglu/context-mode/commits) [![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/1478479412700909750?label=Discord&logo=discord&color=5865f2)](https://discord.gg/DCN9jUgN5v)
+> **Fork of [mksglu/claude-context-mode](https://github.com/mksglu/claude-context-mode).**
+> Adds an LRU result cache, semantic search via synonym expansion, and a persistent
+> cross-session knowledge store (`ctx_remember` / `ctx_recall` / `ctx_index_project`).
+> See [What's different from upstream](#whats-different-from-upstream) and
+> [docs/mega-enhancements.md](docs/mega-enhancements.md) for details.
+> The upstream plugin continues to receive updates independently.
+
+[![GitHub stars](https://img.shields.io/github/stars/mcfredrick/mega-context-mode?style=flat&color=yellow)](https://github.com/mcfredrick/mega-context-mode/stargazers) [![Last commit](https://img.shields.io/github/last-commit/mcfredrick/mega-context-mode?color=green)](https://github.com/mcfredrick/mega-context-mode/commits) [![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
 
 ## The Problem
 
@@ -232,9 +238,14 @@ Global `~/.codex/AGENTS.md` applies to all projects. Project-level `./AGENTS.md`
 | `ctx_index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
 | `ctx_search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
 | `ctx_fetch_and_index` | Fetch URL, detect content type (HTML/JSON/text), chunk and index. | 60 KB → 40 B |
-| `ctx_stats` | Show context savings, call counts, and session statistics. | — |
+| `ctx_stats` | Show context savings, cache hit rate, semantic expansions, and KB stats. | — |
 | `ctx_doctor` | Diagnose installation: runtimes, hooks, FTS5, versions. | — |
 | `ctx_upgrade` | Upgrade to latest version from GitHub, rebuild, reconfigure hooks. | — |
+| `ctx_remember` ✨ | Save content to persistent cross-session knowledge store. | Session → KB |
+| `ctx_recall` ✨ | Semantic search across persistent + session knowledge. | On-demand retrieval |
+| `ctx_index_project` ✨ | Auto-index CLAUDE.md, README, package.json etc. into persistent store. | Future context load |
+
+> ✨ = added in this fork. See [What's different from upstream](#whats-different-from-upstream).
 
 ## How the Sandbox Works
 
@@ -269,6 +280,14 @@ Search results use intelligent extraction instead of truncation. Instead of retu
 - **Calls 1-3:** Normal results (2 per query)
 - **Calls 4-8:** Reduced results (1 per query) + warning
 - **Calls 9+:** Blocked — redirects to `ctx_batch_execute`
+
+### LRU Result Cache ✨
+
+Search results are cached in-process (200-entry LRU Map). Repeated queries — common in multi-query `ctx_batch_execute` flows — skip SQLite after the first call. The cache is cleared on every index write to prevent stale results. Hit rate is visible in `ctx_stats`.
+
+### Semantic Search ✨
+
+`ctx_recall` uses `searchSemantic()` — BM25 + synonym expansion. Querying `"error handling"` also searches for `"exception"`, `"failure"`, `"crash"`, improving recall when indexed content uses different vocabulary than the query. Expansion only fires when the original query leaves result slots unfilled, so precision is not traded away.
 
 ## Session Continuity
 
@@ -512,13 +531,69 @@ Commands chained with `&&`, `;`, or `|` are split — each part is checked separ
 
 **deny** always wins over **allow**. More specific (project-level) rules override global ones.
 
+## What's Different from Upstream
+
+This fork adds three capabilities on top of [mksglu/claude-context-mode](https://github.com/mksglu/claude-context-mode). Everything else — sandbox execution, session continuity, hooks, platform support — is unchanged.
+
+### 1. LRU Result Cache
+
+`ContentStore.searchWithFallback()` caches results in-process (200-entry LRU). Any write clears the cache. This reduces SQLite round-trips in multi-query flows without affecting correctness.
+
+### 2. Semantic Search via Synonym Expansion
+
+`ContentStore.searchSemantic()` runs BM25 on the original query first, then uses a hardcoded domain synonym map to fill remaining slots. Used by `ctx_recall`.
+
+### 3. Persistent Cross-Session Knowledge Store
+
+A second `ContentStore` at `~/.claude/context-mode/knowledge.db` persists across Claude Code restarts. Three new MCP tools use it:
+
+| Tool | Purpose |
+|------|---------|
+| `ctx_index_project` | One-time: index CLAUDE.md, README, package.json etc. into persistent store |
+| `ctx_remember` | Save any content permanently for future sessions |
+| `ctx_recall` | Semantic search across persistent + current session knowledge |
+
+**Why it matters:** Instead of loading a 50 KB CLAUDE.md into context at every session start, `ctx_index_project` chunks it into FTS5 once. Future sessions retrieve only the 2–3 relevant sections via `ctx_recall`.
+
+### ctx_stats Additions
+
+The `ctx_stats` report gains a **Knowledge & Cache** section showing cache hit rate, semantic expansion count, and persistent knowledge store stats (sources, chunks, hit rate).
+
+For full details: [docs/mega-enhancements.md](docs/mega-enhancements.md).
+
+### Install (this fork)
+
+```bash
+git clone https://github.com/mcfredrick/mega-context-mode.git
+cd mega-context-mode && npm install && npm run build
+```
+
+Then register as an MCP server in `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "node",
+      "args": ["/path/to/mega-context-mode/build/server.js"]
+    }
+  }
+}
+```
+
+Or via the CLI:
+
+```bash
+claude mcp add context-mode -- node /path/to/mega-context-mode/build/server.js
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and TDD guidelines.
 
 ```bash
-git clone https://github.com/mksglu/context-mode.git
-cd context-mode && npm install && npm test
+git clone https://github.com/mcfredrick/mega-context-mode.git
+cd mega-context-mode && npm install && npm test
 ```
 
 ## License
