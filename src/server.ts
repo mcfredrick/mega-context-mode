@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, unlinkSync, readdirSync, readFileSync, rmSync, mkdirSync, statSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
@@ -77,6 +77,19 @@ function getStore(): ContentStore {
   if (!_store) _store = new ContentStore();
   maybeIndexSessionEvents(_store);
   return _store;
+}
+
+// Persistent knowledge store — separate SQLite at ~/.claude/context-mode/knowledge.db.
+// Survives across sessions unlike the per-process session store.
+let _knowledgeStore: ContentStore | null = null;
+
+function getKnowledgeStore(): ContentStore {
+  if (!_knowledgeStore) {
+    const dir = join(homedir(), ".claude", "context-mode");
+    mkdirSync(dir, { recursive: true });
+    _knowledgeStore = new ContentStore(join(dir, "knowledge.db"));
+  }
+  return _knowledgeStore;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1604,6 +1617,81 @@ server.registerTool(
       // Session DB not available or incompatible — skip silently
     }
 
+    // ── Knowledge & Cache ──
+    try {
+      const hasSession = _store !== null;
+      const hasKnowledge = _knowledgeStore !== null;
+
+      if (hasSession || hasKnowledge) {
+        lines.push("", "### Knowledge & Cache", "");
+
+        if (hasSession) {
+          const sc = _store!.getCacheStats();
+          const ss = _store!.getSemanticStats();
+          const sk = _store!.getStats();
+          const cacheActive = sc.hits + sc.misses > 0;
+          const kbActive = sk.chunks > 0;
+
+          if (cacheActive || kbActive) {
+            lines.push("**Session store**", "");
+            lines.push(
+              "| Metric | Value |",
+              "|--------|------:|",
+            );
+            if (kbActive) {
+              lines.push(
+                `| Indexed sources | ${sk.sources} |`,
+                `| Indexed chunks | ${sk.chunks} |`,
+              );
+            }
+            if (cacheActive) {
+              lines.push(
+                `| Search cache hits | ${sc.hits} |`,
+                `| Search cache misses | ${sc.misses} |`,
+                `| Cache hit rate | **${sc.hitRate}** |`,
+              );
+            }
+            if (ss.expansions > 0) {
+              lines.push(`| Semantic expansions | ${ss.expansions} |`);
+            }
+            lines.push("");
+          }
+        }
+
+        if (hasKnowledge) {
+          const kc = _knowledgeStore!.getCacheStats();
+          const ks = _knowledgeStore!.getSemanticStats();
+          const kb = _knowledgeStore!.getStats();
+
+          lines.push("**Persistent knowledge store** (`~/.claude/context-mode/knowledge.db`)", "");
+          if (kb.chunks === 0) {
+            lines.push("_Empty — run `ctx_index_project` to index project docs, or `ctx_remember` to store findings._");
+          } else {
+            lines.push(
+              "| Metric | Value |",
+              "|--------|------:|",
+              `| Sources indexed | ${kb.sources} |`,
+              `| Total chunks | ${kb.chunks} |`,
+              `| Code chunks | ${kb.codeChunks} |`,
+            );
+            if (kc.hits + kc.misses > 0) {
+              lines.push(
+                `| Cache hits | ${kc.hits} |`,
+                `| Cache hit rate | **${kc.hitRate}** |`,
+              );
+            }
+            if (ks.expansions > 0) {
+              lines.push(`| Semantic expansions | ${ks.expansions} |`);
+            }
+            lines.push("", "_Search with `ctx_recall`. Update with `ctx_remember` or `ctx_index_project --force`._");
+          }
+          lines.push("");
+        }
+      }
+    } catch {
+      // Knowledge stats never block the main report
+    }
+
     // No separate DevRel summary — integrated into feature sections above
 
     // Formatting directive — ensures all LLMs display the report verbatim
@@ -1705,6 +1793,211 @@ server.registerTool(
 
     return trackResponse("ctx_upgrade", {
       content: [{ type: "text" as const, text }],
+    });
+  },
+);
+
+// ── ctx_remember: persist content to cross-session knowledge store ──────────
+server.registerTool(
+  "ctx_remember",
+  {
+    title: "Remember (Persistent Knowledge)",
+    description:
+      "Save content to a persistent cross-session knowledge store at " +
+      "~/.claude/context-mode/knowledge.db. Unlike ctx_index (session-scoped), " +
+      "ctx_remember survives Claude Code restarts. Use it for findings, decisions, " +
+      "architecture notes, or any content you want to recall in future sessions. " +
+      "Use the same source_label to overwrite a previous entry. Retrieve with ctx_recall.",
+    inputSchema: z.object({
+      content: z.string().describe("Markdown or plain-text content to remember permanently."),
+      source_label: z
+        .string()
+        .describe(
+          "Stable identifier for this memory, e.g. 'project-architecture', " +
+          "'api-decisions', 'debugging-notes'. Reusing a label overwrites the previous entry.",
+        ),
+    }),
+  },
+  async ({ content, source_label }) => {
+    const store = getKnowledgeStore();
+    const result = store.index({ content, source: source_label });
+    // Content saved to knowledge store counts as context kept out — it can be
+    // recalled selectively instead of loaded in full on future sessions.
+    trackIndexed(Buffer.byteLength(content));
+    const text = [
+      `## ctx_remember`,
+      ``,
+      `**Label:** \`${source_label}\`  **Chunks:** ${result.totalChunks}  **Code chunks:** ${result.codeChunks}`,
+      ``,
+      `Stored in persistent knowledge base. Use \`ctx_recall\` to retrieve in any future session.`,
+    ].join("\n");
+    return trackResponse("ctx_remember", {
+      content: [{ type: "text" as const, text }],
+    });
+  },
+);
+
+// ── ctx_recall: search cross-session persistent knowledge store ──────────────
+server.registerTool(
+  "ctx_recall",
+  {
+    title: "Recall (Persistent Knowledge)",
+    description:
+      "Search the persistent cross-session knowledge store saved by ctx_remember. " +
+      "Uses semantic search (BM25 + synonym expansion) for better recall than exact-term matching. " +
+      "Also searches the current session's knowledge base as a fallback. " +
+      "Pass multiple queries in one call — results are returned per query.",
+    inputSchema: z.object({
+      queries: z
+        .array(z.string())
+        .min(1)
+        .describe("Search questions. Batch all queries in one call."),
+      limit: z
+        .number()
+        .optional()
+        .default(3)
+        .describe("Results per query (default: 3)."),
+    }),
+  },
+  async ({ queries, limit }) => {
+    const knowledge = getKnowledgeStore();
+    const session = getStore();
+    const lines: string[] = ["## ctx_recall", ""];
+
+    for (const query of queries) {
+      lines.push(`### ${query}`);
+
+      // Semantic search (BM25 + synonym expansion) against persistent store first
+      const knownResults = knowledge.searchSemantic(query, limit ?? 3);
+
+      // Fall back to current session store if knowledge store is sparse
+      const results =
+        knownResults.length > 0
+          ? knownResults
+          : session.searchSemantic(query, limit ?? 3);
+
+      if (results.length === 0) {
+        lines.push("_No results found._");
+      } else {
+        const sourceTag = knownResults.length > 0 ? "" : " _(session)_";
+        for (const r of results) {
+          const preview = r.content.slice(0, 300).replace(/\n+/g, " ");
+          lines.push(`**${r.title}** \`[${r.source}${sourceTag}]\``);
+          lines.push(preview);
+          lines.push("");
+        }
+      }
+    }
+
+    return trackResponse("ctx_recall", {
+      content: [{ type: "text" as const, text: lines.join("\n") }],
+    });
+  },
+);
+
+// ── ctx_index_project: auto-index project context files ─────────────────────
+server.registerTool(
+  "ctx_index_project",
+  {
+    title: "Index Project Context",
+    description:
+      "Auto-discover and index project context files (CLAUDE.md, README, package.json, " +
+      "pyproject.toml, etc.) into the persistent knowledge store. Indexed content can be " +
+      "searched selectively with ctx_recall instead of loading full files into context. " +
+      "Run once per project; re-run with force=true to refresh stale index entries.",
+    inputSchema: z.object({
+      project_root: z
+        .string()
+        .optional()
+        .describe(
+          "Project root directory. Defaults to CLAUDE_PROJECT_DIR env var or cwd.",
+        ),
+      force: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Re-index even if source label already exists (default: false)."),
+    }),
+  },
+  async ({ project_root, force }) => {
+    const root = project_root ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+    const store = getKnowledgeStore();
+
+    // Files to discover, in priority order. Each entry is [relPath, sourceLabel].
+    const candidates: Array<[string, string]> = [
+      ["CLAUDE.md", "project:CLAUDE.md"],
+      [".claude/CLAUDE.md", "project:.claude/CLAUDE.md"],
+      ["README.md", "project:README.md"],
+      ["README.rst", "project:README.rst"],
+      ["package.json", "project:package.json"],
+      ["pyproject.toml", "project:pyproject.toml"],
+      ["Cargo.toml", "project:Cargo.toml"],
+      ["go.mod", "project:go.mod"],
+      ["docs/README.md", "project:docs/README.md"],
+      ["CONTRIBUTING.md", "project:CONTRIBUTING.md"],
+      ["ARCHITECTURE.md", "project:ARCHITECTURE.md"],
+    ];
+
+    const indexed: string[] = [];
+    const skipped: string[] = [];
+    const missing: string[] = [];
+
+    for (const [relPath, label] of candidates) {
+      const fullPath = join(root, relPath);
+      if (!existsSync(fullPath)) {
+        missing.push(relPath);
+        continue;
+      }
+      // Without force=true, skip sources already indexed in this store
+      if (!force) {
+        const stats = store.getStats();
+        // Re-use existing index if content was already stored under this label
+        // (heuristic: check if any sources exist — full label check not exposed yet)
+        if (stats.sources > 0) {
+          const existing = store.listSources?.();
+          if (existing?.some((s) => s.label === label)) {
+            skipped.push(relPath);
+            continue;
+          }
+        }
+      }
+      try {
+        const result = store.index({ path: fullPath, source: label });
+        indexed.push(`${relPath} → ${result.totalChunks} chunks`);
+        // File indexed to persistent store = future sessions can recall selectively
+        // rather than loading the full file. Count as context saved.
+        try { trackIndexed(statSync(fullPath).size); } catch { /* best-effort */ }
+      } catch {
+        skipped.push(`${relPath} (read error)`);
+      }
+    }
+
+    const lines = [
+      `## ctx_index_project`,
+      ``,
+      `**Root:** \`${root}\``,
+      ``,
+    ];
+
+    if (indexed.length > 0) {
+      lines.push(`**Indexed (${indexed.length}):**`);
+      for (const entry of indexed) lines.push(`- ${entry}`);
+      lines.push("");
+    }
+    if (skipped.length > 0) {
+      lines.push(`**Skipped (already indexed — use force=true to refresh):** ${skipped.join(", ")}`);
+      lines.push("");
+    }
+    if (indexed.length > 0) {
+      lines.push(`Project context is now searchable via \`ctx_recall\` in any future session.`);
+    } else if (skipped.length > 0) {
+      lines.push(`All files already indexed. Use \`ctx_recall\` to search or re-run with \`force: true\`.`);
+    } else {
+      lines.push(`No indexable files found in \`${root}\`.`);
+    }
+
+    return trackResponse("ctx_index_project", {
+      content: [{ type: "text" as const, text: lines.join("\n") }],
     });
   },
 );

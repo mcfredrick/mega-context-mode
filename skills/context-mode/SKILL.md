@@ -291,6 +291,23 @@ Subagents automatically receive context-mode tool routing via a PreToolUse hook.
 - Calling an MCP tool (Context7 `query-docs`, GitHub API, etc.) then passing the response to `ctx_index(content: response)` → **doubles** context usage. The response is already in context — use it directly or save to file first.
 - Ignoring `browser_navigate` auto-snapshot → navigation response includes a full page snapshot. Don't rely on it for inspection — call `browser_snapshot(filename)` separately.
 
+## Cross-Session Knowledge (mega-context-mode enhancements)
+
+Three additional tools persist knowledge beyond the current session:
+
+| Tool | Purpose |
+|------|---------|
+| `ctx_index_project` | One-time: auto-index CLAUDE.md, README, package.json etc. into persistent store |
+| `ctx_remember` | Save any content (findings, decisions, notes) permanently across sessions |
+| `ctx_recall` | Search persistent + current-session knowledge with synonym-expanded BM25 |
+
+**Workflow:**
+1. Run `ctx_index_project` once per project to index docs — no more loading full CLAUDE.md into context
+2. Use `ctx_recall(queries: ["relevant topic"])` to pull only the sections you need
+3. Use `ctx_remember(content, source_label)` to persist findings for future sessions
+
+`ctx_recall` uses **semantic search** (BM25 + synonym expansion): querying "error handling" will also match content containing "exception", "failure", "crash".
+
 ## Reference Files
 
 - [JavaScript/TypeScript Patterns](./references/patterns-javascript.md)

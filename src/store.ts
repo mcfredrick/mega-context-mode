@@ -11,7 +11,7 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -103,6 +103,53 @@ function maxEditDistance(wordLength: number): number {
 const MAX_CHUNK_BYTES = 4096;
 
 // ─────────────────────────────────────────────────────────
+// Semantic expansion
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Domain synonym map for semantic query expansion.
+ * Keys are canonical terms; values are fallback synonyms to append when the
+ * key appears in a query. Keeps the list narrow — quality over coverage.
+ */
+const QUERY_SYNONYMS: Record<string, string[]> = {
+  error:       ["exception", "failure", "crash"],
+  fix:         ["resolve", "patch", "repair"],
+  install:     ["setup", "configure", "deploy"],
+  test:        ["spec", "assert", "verify"],
+  function:    ["method", "handler", "procedure"],
+  class:       ["type", "interface", "struct"],
+  file:        ["module", "script", "document"],
+  search:      ["find", "query", "lookup"],
+  index:       ["store", "persist", "catalog"],
+  performance: ["speed", "latency", "throughput"],
+  auth:        ["authentication", "login", "token"],
+  request:     ["fetch", "http", "endpoint"],
+  response:    ["result", "reply", "output"],
+  database:    ["db", "sqlite", "storage"],
+  config:      ["configuration", "settings", "options"],
+  log:         ["logging", "trace", "debug"],
+  deploy:      ["release", "publish", "build"],
+  import:      ["require", "dependency", "package"],
+};
+
+/**
+ * Expand a query string with up to 4 synonym terms drawn from QUERY_SYNONYMS.
+ * Returns the original query unchanged when no synonyms match.
+ */
+function expandQueryTerms(query: string): string {
+  const words = query.toLowerCase().trim().split(/\s+/);
+  const additions: string[] = [];
+  for (const word of words) {
+    const synonyms = QUERY_SYNONYMS[word];
+    if (synonyms) {
+      additions.push(...synonyms.slice(0, 2));
+    }
+    if (additions.length >= 4) break;
+  }
+  return additions.length > 0 ? `${query} ${additions.join(" ")}` : query;
+}
+
+// ─────────────────────────────────────────────────────────
 // ContentStore
 // ─────────────────────────────────────────────────────────
 
@@ -166,6 +213,19 @@ export class ContentStore {
   #stmtSourceChunkCount!: PreparedStatement;
   #stmtChunkContent!: PreparedStatement;
   #stmtStats!: PreparedStatement;
+
+  // ── LRU Result Cache ──
+  // Keyed by "query\0limit\0source". Map preserves insertion order so the
+  // oldest entry is always first — perfect for O(1) LRU eviction.
+  // Cleared on every write so stale hits never surface.
+  #searchCache = new Map<string, SearchResult[]>();
+  static readonly #CACHE_CAP = 200;
+
+  // ── Observability counters ──
+  // Exposed via getCacheStats() / getSemanticStats() for ctx_stats display.
+  #cacheHits = 0;
+  #cacheMisses = 0;
+  #semanticExpansions = 0;
 
   constructor(dbPath?: string) {
     const Database = loadDatabase();
@@ -428,6 +488,8 @@ export class ContentStore {
    */
   #insertChunks(chunks: Chunk[], label: string, text: string): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
+    // Any write invalidates cached search results — correctness over cache hits.
+    this.#searchCache.clear();
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -568,6 +630,29 @@ export class ContentStore {
     limit: number = 3,
     source?: string,
   ): SearchResult[] {
+    const ck = `${query}\0${limit}\0${source ?? ""}`;
+    const hit = this.#searchCache.get(ck);
+    if (hit) {
+      this.#cacheHits++;
+      // Re-insert to mark as recently used (LRU touch)
+      this.#searchCache.delete(ck);
+      this.#searchCache.set(ck, hit);
+      return hit;
+    }
+    this.#cacheMisses++;
+    const result = this.#searchWithFallbackImpl(query, limit, source);
+    if (this.#searchCache.size >= ContentStore.#CACHE_CAP) {
+      this.#searchCache.delete(this.#searchCache.keys().next().value!);
+    }
+    this.#searchCache.set(ck, result);
+    return result;
+  }
+
+  #searchWithFallbackImpl(
+    query: string,
+    limit: number = 3,
+    source?: string,
+  ): SearchResult[] {
     // Layer 1a: Porter + AND (most precise)
     const porterAnd = this.search(query, limit, source, "AND");
     if (porterAnd.length > 0) {
@@ -628,6 +713,42 @@ export class ContentStore {
     }
 
     return [];
+  }
+
+  // ── Semantic Search ──
+
+  /**
+   * BM25 search augmented with synonym expansion.
+   *
+   * Runs the original query first (highest precision), then fills remaining
+   * slots from a synonym-expanded query. Results are deduped by title+source
+   * and sorted by BM25 rank. Use this when exact term matches may miss
+   * conceptually related content.
+   */
+  searchSemantic(
+    query: string,
+    limit: number = 5,
+    source?: string,
+  ): SearchResult[] {
+    const expanded = expandQueryTerms(query);
+    const combined = new Map<string, SearchResult>();
+
+    for (const r of this.searchWithFallback(query, limit, source)) {
+      combined.set(`${r.title}\0${r.source}`, r);
+    }
+
+    // Only hit the expanded query when the original leaves slots unfilled
+    if (expanded !== query && combined.size < limit) {
+      const expandedResults = this.searchWithFallback(expanded, limit, source);
+      if (expandedResults.length > 0) this.#semanticExpansions++;
+      for (const r of expandedResults) {
+        const key = `${r.title}\0${r.source}`;
+        if (!combined.has(key)) combined.set(key, r);
+        if (combined.size >= limit) break;
+      }
+    }
+
+    return Array.from(combined.values()).sort((a, b) => a.rank - b.rank);
   }
 
   // ── Sources ──
@@ -722,6 +843,20 @@ export class ContentStore {
       chunks: row?.chunks ?? 0,
       codeChunks: row?.codeChunks ?? 0,
     };
+  }
+
+  // ── Observability ──
+
+  /** LRU cache performance for the current process lifetime. */
+  getCacheStats(): { hits: number; misses: number; hitRate: string } {
+    const total = this.#cacheHits + this.#cacheMisses;
+    const rate = total === 0 ? "—" : `${Math.round((this.#cacheHits / total) * 100)}%`;
+    return { hits: this.#cacheHits, misses: this.#cacheMisses, hitRate: rate };
+  }
+
+  /** How many times synonym expansion found additional results this process lifetime. */
+  getSemanticStats(): { expansions: number } {
+    return { expansions: this.#semanticExpansions };
   }
 
   // ── Cleanup ──
